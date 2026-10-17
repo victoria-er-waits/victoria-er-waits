@@ -109,7 +109,7 @@ def decide(found, now):
                 out[el] = "Closed"  # posted hours: 7 a.m. to 10 p.m. only
             elif raw and wait_ok(raw):
                 out[el] = raw
-            elif raw and raw.strip().upper() == "OPEN":
+            elif raw and (raw.strip().upper() == "OPEN" or re.match(r"^open\b.*unavailable", raw.strip(), re.I)):
                 out[el] = SPH_OPEN_NO_WAIT
         else:
             if raw and wait_ok(raw):
