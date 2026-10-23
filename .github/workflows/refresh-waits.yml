@@ -2,7 +2,9 @@ name: Refresh ER waits
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Offset from the peak :00/:15/:30/:45 minutes — GitHub drops peak-minute
+    # schedules most. Each fire starts a marathon run (below).
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,6 +17,11 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # GitHub's scheduler is best-effort and fires this workflow only a few
+    # times a day, so a single run keeps refreshing on a 15-minute loop for
+    # up to ~5.5 hours instead of refreshing once. Scheduled fires overlap
+    # into near-continuous coverage; the concurrency group serializes runs.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -22,23 +29,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run refresh script
-        id: refresh
-        run: |
-          set +e
-          python3 scripts/refresh_waits.py --index index.html > refresh.out 2> refresh.err
-          code=$?
-          cat refresh.err
-          grep '^CHANGED=' refresh.out >> "$GITHUB_OUTPUT" || true
-          grep '^COMMIT_MSG=' refresh.out | sed 's/^COMMIT_MSG=//' > commit_msg.txt || true
-          if [ "$code" -ne 0 ]; then echo "::warning::refresh script exited with code $code (see log above)"; fi
-          exit 0
-
-      - name: Commit and push if changed
-        if: steps.refresh.outputs.CHANGED == 'true'
+      - name: Refresh on a loop for up to ~5.5 hours
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.html
-          git commit -m "$(cat commit_msg.txt)"
-          git push
+          end=$(( $(date +%s) + 19800 ))
+          while :; do
+            git pull --rebase origin main || true
+            set +e
+            python3 scripts/refresh_waits.py --index index.html > refresh.out 2> refresh.err
+            code=$?
+            set -e
+            cat refresh.err || true
+            if [ "$code" -eq 2 ]; then
+              echo "::error::Island Health page structure changed (script exit 2) — stopping run so this is visible."
+              exit 1
+            fi
+            if [ "$code" -ne 0 ]; then
+              echo "::warning::refresh script exited with code $code (transient source failure) — will retry next cycle."
+            elif grep -q '^CHANGED=true' refresh.out; then
+              msg=$(grep '^COMMIT_MSG=' refresh.out | sed 's/^COMMIT_MSG=//')
+              git add index.html
+              git commit -m "$msg"
+              git push
+            else
+              echo "No change this cycle."
+            fi
+            if [ "$(date +%s)" -ge "$end" ]; then
+              echo "Marathon window complete."
+              break
+            fi
+            sleep 900
+          done
