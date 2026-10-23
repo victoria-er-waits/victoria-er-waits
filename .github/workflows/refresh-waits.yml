@@ -1,0 +1,44 @@
+name: Refresh ER waits
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-waits
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run refresh script
+        id: refresh
+        run: |
+          set +e
+          python3 scripts/refresh_waits.py --index index.html > refresh.out 2> refresh.err
+          code=$?
+          cat refresh.err
+          grep '^CHANGED=' refresh.out >> "$GITHUB_OUTPUT" || true
+          grep '^COMMIT_MSG=' refresh.out | sed 's/^COMMIT_MSG=//' > commit_msg.txt || true
+          if [ "$code" -ne 0 ]; then echo "::warning::refresh script exited with code $code (see log above)"; fi
+          exit 0
+
+      - name: Commit and push if changed
+        if: steps.refresh.outputs.CHANGED == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "$(cat commit_msg.txt)"
+          git push
