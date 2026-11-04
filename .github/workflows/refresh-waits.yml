@@ -9,6 +9,9 @@ on:
 
 permissions:
   contents: write
+  # actions: write lets the self-chain step below trigger the next marathon
+  # via the workflow_dispatch API using GITHUB_TOKEN.
+  actions: write
 
 concurrency:
   group: refresh-waits
@@ -19,8 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     # GitHub's scheduler is best-effort and fires this workflow only a few
     # times a day, so a single run keeps refreshing on a 15-minute loop for
-    # up to ~5.5 hours instead of refreshing once. Scheduled fires overlap
-    # into near-continuous coverage; the concurrency group serializes runs.
+    # up to ~5.5 hours instead of refreshing once. Coverage used to depend on
+    # scheduled fires overlapping into near-continuous coverage, but the
+    # scheduler twice left a gap after a marathon ended (2026-11-02 and
+    # 2026-11-03), so each successful marathon now triggers its own
+    # successor (step below); the schedule stays as backup. The concurrency
+    # group serializes runs.
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -61,3 +68,27 @@ jobs:
             fi
             sleep 900
           done
+
+      # Self-chain (added 2026-11-03): after a successful marathon, trigger
+      # the next one so coverage no longer depends on GitHub's sparse,
+      # best-effort schedule fires. workflow_dispatch events triggered by
+      # GITHUB_TOKEN do create new runs (documented exception to the
+      # no-recursive-runs rule). Runs only on success: if the refresh loop
+      # failed (e.g. Island Health structure change), the chain stops so the
+      # failure stays visible instead of looping. A failed dispatch only
+      # warns — the schedule backup and the watchdog remain.
+      - name: Trigger the next marathon run (self-chain)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/refresh-waits.yml/dispatches" \
+            -d '{"ref":"main"}')
+          if [ "$code" = "204" ]; then
+            echo "Self-chain dispatch accepted (HTTP 204) — next marathon queued."
+          else
+            echo "::warning::Self-chain dispatch returned HTTP $code — schedule backup remains; watchdog will flag any resulting gap."
+          fi
