@@ -1,0 +1,94 @@
+name: Refresh ER waits
+
+on:
+  schedule:
+    # Offset from the peak :00/:15/:30/:45 minutes — GitHub drops peak-minute
+    # schedules most. Each fire starts a marathon run (below).
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # actions: write lets the self-chain step below trigger the next marathon
+  # via the workflow_dispatch API using GITHUB_TOKEN.
+  actions: write
+
+concurrency:
+  group: refresh-waits
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # GitHub's scheduler is best-effort and fires this workflow only a few
+    # times a day, so a single run keeps refreshing on a 15-minute loop for
+    # up to ~5.5 hours instead of refreshing once. Coverage used to depend on
+    # scheduled fires overlapping into near-continuous coverage, but the
+    # scheduler twice left a gap after a marathon ended (2026-11-02 and
+    # 2026-11-03), so each successful marathon now triggers its own
+    # successor (step below); the schedule stays as backup. The concurrency
+    # group serializes runs.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Refresh on a loop for up to ~5.5 hours
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          end=$(( $(date +%s) + 19800 ))
+          while :; do
+            git pull --rebase origin main || true
+            set +e
+            python3 scripts/refresh_waits.py --index index.html > refresh.out 2> refresh.err
+            code=$?
+            set -e
+            cat refresh.err || true
+            if [ "$code" -eq 2 ]; then
+              echo "::error::Island Health page structure changed (script exit 2) — stopping run so this is visible."
+              exit 1
+            fi
+            if [ "$code" -ne 0 ]; then
+              echo "::warning::refresh script exited with code $code (transient source failure) — will retry next cycle."
+            elif grep -q '^CHANGED=true' refresh.out; then
+              msg=$(grep '^COMMIT_MSG=' refresh.out | sed 's/^COMMIT_MSG=//')
+              git add index.html
+              git commit -m "$msg"
+              git push
+            else
+              echo "No change this cycle."
+            fi
+            if [ "$(date +%s)" -ge "$end" ]; then
+              echo "Marathon window complete."
+              break
+            fi
+            sleep 900
+          done
+
+      # Self-chain (added 2026-11-03): after a successful marathon, trigger
+      # the next one so coverage no longer depends on GitHub's sparse,
+      # best-effort schedule fires. workflow_dispatch events triggered by
+      # GITHUB_TOKEN do create new runs (documented exception to the
+      # no-recursive-runs rule). Runs only on success: if the refresh loop
+      # failed (e.g. Island Health structure change), the chain stops so the
+      # failure stays visible instead of looping. A failed dispatch only
+      # warns — the schedule backup and the watchdog remain.
+      - name: Trigger the next marathon run (self-chain)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/refresh-waits.yml/dispatches" \
+            -d '{"ref":"main"}')
+          if [ "$code" = "204" ]; then
+            echo "Self-chain dispatch accepted (HTTP 204) — next marathon queued."
+          else
+            echo "::warning::Self-chain dispatch returned HTTP $code — schedule backup remains; watchdog will flag any resulting gap."
+          fi
