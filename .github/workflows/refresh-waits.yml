@@ -40,9 +40,36 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # safe_sync: pull latest main, rebasing our local refresh commit(s) on top.
+          # If the rebase conflicts, abort it and reset to origin/main so the runner
+          # is never left mid-rebase; the local refresh snapshot is discarded and the
+          # next cycle re-scrapes fresh Island Health data. Never force-pushes and
+          # never overwrites remote history. Returns 0 on a clean sync, 1 if the sync
+          # failed but the repo is clean (caller continues); exits the run only if the
+          # repo is still mid-rebase after cleanup (unrecoverable -- fail visibly).
+          safe_sync() {
+            if git pull --rebase origin main; then
+              return 0
+            fi
+            if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+              echo "::warning::Rebase conflict -- aborting rebase and resetting to origin/main. The local refresh snapshot is discarded; the next cycle re-scrapes fresh Island Health data."
+              git rebase --abort || true
+              git reset --hard origin/main || true
+              if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+                echo "::error::Could not clear the rebase state -- stopping the run so this is visible instead of continuing broken."
+                exit 1
+              fi
+            else
+              echo "::warning::git pull failed (network or remote error) -- continuing with local state."
+            fi
+            return 1
+          }
+
+          failed_push_cycles=0
           end=$(( $(date +%s) + 19800 ))
           while :; do
-            git pull --rebase origin main || true
+            safe_sync || true
             set +e
             python3 scripts/refresh_waits.py --index index.html > refresh.out 2> refresh.err
             code=$?
@@ -58,7 +85,40 @@ jobs:
               msg=$(grep '^COMMIT_MSG=' refresh.out | sed 's/^COMMIT_MSG=//')
               git add index.html
               git commit -m "$msg"
-              git push
+              # Publish with retries. A transient GitHub-side push failure (e.g. the
+              # 2026-11-25 "fatal error in commit_refs_rules") must not kill the
+              # marathon or break the self-chain. Retry up to 3 times, 60s apart,
+              # re-syncing before each retry. If all retries fail, warn and keep
+              # looping -- the next cycle re-scrapes fresh Island Health data and
+              # retries. Only a genuine script failure (exit 2) stops the run.
+              # Never force-pushes. (RETRY_SLEEP is 60s in production; tests set it
+              # to 1s so the retry timing can be exercised quickly.)
+              pushed=0
+              for attempt in 1 2 3; do
+                if git push; then
+                  pushed=1
+                  break
+                fi
+                echo "::warning::git push failed (attempt $attempt/3)."
+                if [ "$attempt" -eq 3 ]; then
+                  break
+                fi
+                echo "Retrying in ${RETRY_SLEEP:-60}s."
+                sleep "${RETRY_SLEEP:-60}"
+                safe_sync || true
+                # If the re-sync discarded our snapshot (rebase conflict), there is
+                # nothing left to push -- stop retrying; the next cycle re-scrapes
+                # fresh data.
+                ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo -1)
+                if [ "$ahead" -eq 0 ]; then
+                  echo "::warning::Local refresh snapshot was discarded during re-sync -- nothing to push; the next cycle re-scrapes fresh data."
+                  break
+                fi
+              done
+              if [ "$pushed" -eq 0 ]; then
+                failed_push_cycles=$((failed_push_cycles + 1))
+                echo "::warning::git push failed 3 times this cycle -- keeping the local commit and continuing to the next cycle, which re-scrapes fresh Island Health data."
+              fi
             else
               echo "No change this cycle."
             fi
@@ -68,6 +128,21 @@ jobs:
             fi
             sleep 900
           done
+
+          # If the marathon ends with unpublished refresh commit(s), the run has
+          # failed -- say so loudly instead of reporting success. The self-chain
+          # does not fire on failure (by design), and the watchdog will flag the
+          # stale page.
+          git fetch origin main || true
+          unpushed=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo -1)
+          if [ "$unpushed" -lt 0 ]; then
+            echo "::error::Could not verify the publish state at marathon end (rev-list failed) -- stopping so this is visible."
+            exit 1
+          fi
+          if [ "$unpushed" -gt 0 ]; then
+            echo "::error::Marathon ended with $unpushed unpublished refresh commit(s) (push failed in $failed_push_cycles cycle(s)) -- see warnings above. The page may be stale."
+            exit 1
+          fi
 
       # Self-chain (added 2026-11-03): after a successful marathon, trigger
       # the next one so coverage no longer depends on GitHub's sparse,
